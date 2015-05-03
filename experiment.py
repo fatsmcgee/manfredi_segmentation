@@ -2,14 +2,15 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import os
-
+import time
+from sklearn import svm
 
 def mask_from_image(image,imtype):
     if imtype == 'flowers':
         return np.logical_and(image[:,:,2]==128,image[:,:,1]==0)
 
 #1. rimages,masks = load_images('flowers',100)
-def load_images(imtype, n_images,rand_order):
+def load_images(imtype, n_images,rand_order,skip=0):
     
     rimages = []
     masks = []
@@ -29,7 +30,7 @@ def load_images(imtype, n_images,rand_order):
     if rand_order:
         np.random.shuffle(i_m_fs)
         
-    for im_f,m_f in i_m_fs[:n_images]:
+    for im_f,m_f in i_m_fs[skip:skip+n_images]:
         im = cv2.imread(im_f)
         rimages.append(cv2.resize(im,newsize))
         
@@ -82,13 +83,17 @@ def get_hog_features(image):
     
     descriptor = cv2.HOGDescriptor(winSize,blockSize,blockStride,cellSize,bins)
     return descriptor.compute(image).flatten()
-    
+  
+def get_image_feature(rimage,imtype):
+    if imtype == 'flowers':
+        return get_hog_features(rimage)
+        
 def get_image_features(rimages, imtype):
     if imtype == 'flowers':
-        return [get_hog_features(i) for i in rimages]
+        return [get_image_feature(i,imtype) for i in rimages]
 
     
-def get_image_histogram(qimage,mask,bins):
+def get_image_histogram(qimage,mask,bins,regularize=False):
     foremask = mask.astype('uint8')
     fore = (qimage+1)*foremask
     forehist = np.bincount(fore.flatten(),minlength=bins+1)[1:]
@@ -97,6 +102,10 @@ def get_image_histogram(qimage,mask,bins):
     back = (qimage+1)*backmask
     backhist = np.bincount(back.flatten(),minlength=bins+1)[1:]
     
+    if regularize:
+        forehist +=1
+        backhist +=1
+    
     return forehist,backhist
     
 def get_global_histograms(qimages,masks,bins):
@@ -104,37 +113,44 @@ def get_global_histograms(qimages,masks,bins):
     back_global = np.zeros(bins,'uint64')
     for qim,mask in zip(qimages,masks):
         fhist,bhist = get_image_histogram(qim,mask,bins)
-        fore_global += fhist
-        back_global += bhist
+        fore_global += fhist.astype('uint64')
+        back_global += bhist.astype('uint64')
         
     #don't allow any bin to be zero
     fore_global +=1
     back_global +=1 
     return fore_global,back_global
     
+def get_minus_log_prob_pixels(qimage,hist):
+    sumhist = hist.sum()
+    probs = hist[qimage]/float(sumhist)
+    return -np.log(probs)
 
 def get_fidelity_to_histogram(qimage,mask,forehist,backhist):
 
     #for each pixel in rimage:
     #if foreground get loss to background
     #if background get loss to foreground
-    sumback = backhist.sum()
-    sumfore = forehist.sum()
+    #sumback = backhist.sum()
+    #sumfore = forehist.sum()
     rows,cols = qimage.shape
     
     fidmap = np.zeros(qimage.shape) 
     
-    backprobs = backhist[qimage]/float(sumback)
-    backfidelities = -np.log(backprobs)
+    #backprobs = backhist[qimage]/float(sumback)
+    #backfidelities = -np.log(backprobs)
+    backfidelities = get_minus_log_prob_pixels(qimage,backhist)    
     
-    foreprobs = forehist[qimage]/float(sumfore)
-    forefidelities = -np.log(foreprobs)
+    #foreprobs = forehist[qimage]/float(sumfore)
+    #forefidelities = -np.log(foreprobs)
+    forefidelities = get_minus_log_prob_pixels(qimage,forehist)
     
     fidmap[mask] = backfidelities[mask]
     backmask = np.logical_not(mask)
     fidmap[backmask] = forefidelities[backmask]
     
-    return np.sum(fidmap)/(rows*cols),fidmap
+    fidelity = np.sum(fidmap)/(rows*cols)
+    return fidelity,fidmap
     
 
 def theta(feat1,feat2,sigma):
@@ -145,6 +161,84 @@ def omega1(mask1,mask2):
     total_same =  np.sum(mask1.astype('uint8')==mask2.astype('uint8'))
     npixels = mask1.shape[0]*mask1.shape[1]
     return total_same/float(npixels)
+    
+def omega2(qim1,qim2,mask1,mask2,bins):
+    #get the histograms of mask 2 applied to image 1
+    forehist,backhist = get_image_histogram(qim1,mask2,bins,True)
+    fidelity,_ = get_fidelity_to_histogram(qim1,mask1,forehist,backhist)
+    return fidelity
+    
+def omega3(qim1,qim2,mask1,mask2,global_forehist,global_backhist):
+    im1fidelity,_ = get_fidelity_to_histogram(qim1,mask1,global_forehist,global_backhist)
+    im2fidelity,_ = get_fidelity_to_histogram(qim2,mask2,global_forehist,global_backhist)
+    return im1fidelity*im2fidelity
+    
+def K(feat1,feat2,qim1,qim2,mask1,mask2,global_forehist,global_backhist,bins,sigma,beta):
+    thetaval = theta(feat1,feat2,sigma)
+    o1val = beta[0]*omega1(mask1,mask2)
+    o2val = beta[1]*omega2(qim1,qim2,mask1,mask2,bins)
+    o3val = beta[2]*omega3(qim1,qim2,mask1,mask2,global_forehist,global_backhist)
+    return thetaval*(o1val+o2val+o3val)
+    
+
+
+def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehist,\
+                            global_backhist,qbins,totalbins,sigma,imtype,\
+                            betas,alpha,support_vecs):
+    #first resize test image to the correct size and gather features
+    rtest = cv2.resize(testimg,qimages[0].shape)
+    qtest = get_quantized_image(rtest,qbins)
+    feattest = get_image_feature(rtest,imtype)
+    #based on test image (j) compared to each support vector image-mask (i)
+    
+    #the test part of these coefficients, as defined in the paper
+    #L(x_{jp} | B_G)
+    pf3ip_test = get_minus_log_prob_pixels(qtest,global_backhist)
+    #L(X_{jp} | F_G)
+    pb3ip_test = get_minus_log_prob_pixels(qtest,global_forehist)
+    
+    thetas = []
+    fore_hists = []
+    back_hists = []
+    gammas = []
+    
+    #get infomation for each support vector
+    for idx in support_vecs:
+        print 'support vec info ',idx
+        #same as typical
+        thetas.append(theta(feattest,imfeatures[idx],sigma))
+        forehist,backhist = get_image_histogram(qtest,masks[idx],totalbins,True)
+        fore_hists.append(forehist)
+        back_hists.append(backhist)
+        
+        svecfidelity,_ = get_fidelity_to_histogram(qimages[idx],masks[idx],global_forehist,global_backhist)
+        gammas.append(svecfidelity)
+
+    fore_potential = np.zeros(qtest.shape)    
+    back_potential = np.zeros(qtest.shape)
+    
+    for i,idx in enumerate(support_vecs):
+        print 'support vec term ',i
+        support_theta = thetas[i]
+        
+        #support_fore = np.zeros(rtest.shape)    
+        support_fore = betas[0]*masks[idx]
+        support_fore += betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
+        support_fore += betas[2] * pf3ip_test * gammas[i]
+        support_fore *= support_theta
+        support_fore *= alpha[idx]
+        fore_potential += support_fore
+        
+        #support_back = np.zeros(rtest.shape)
+        support_back = betas[0]*(1-masks[idx])
+        support_back += betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
+        support_back += betas[2] * pb3ip_test * gammas[i]
+        support_back *= support_theta
+        support_back *= alpha[idx]
+        back_potential += support_back
+        
+    #now compute foreground potentials
+    return fore_potential,back_potential
     
 os.chdir(r"C:\Users\gumpy\Desktop\Class Notes\Advanced Machine Learning\Project\src")
 
@@ -158,30 +252,70 @@ imfeatures = []
 #flowers or pedestrians
 imtype = 'flowers' 
 #use a random order of images or load image 1,2,3... in alphabetical dir order
-rand_order = True
-n_images = 300
+rand_order = False
+n_images = 200
+gram = np.zeros((n_images,n_images))
 #quantization bins per channel
 qbins = 16
-total_color_bins = int(qbins**3)
+totalbins = int(qbins**3)
 
-print 'Loading images'
-rimages,masks,imfiles,mfiles = load_images(imtype,n_images,rand_order)
+sigma = .25 #try .1, try .01, try .5, try 1
+#start with the Manfredi flowers parameters
+betas = (0.2,1.0,0.16)
+v = .45
+
+
+print 'Loading images and test images'
+rimages,masks,_,_ = load_images(imtype,n_images,rand_order)
+testimages,_,_,_ = load_images(imtype,100,rand_order,n_images)
+
 print 'Quantizing images'
 qimages = get_quantized_images(rimages,qbins)
 print 'Extracting image features'
 imfeatures = get_image_features(rimages,imtype)
 print 'Getting global color histogram'
-fore_global_hist, back_global_hist = get_global_histograms(qimages,masks,total_color_bins)
+fore_global_hist, back_global_hist = get_global_histograms(qimages,masks,totalbins)
 print 'Done'
 
-sigma = .25 #try .1, try .01, try .5, try 1
 
+print 'Computing gram matrix'
+for i in range(n_images):
+    print "Row ",i
+    for j in range(n_images):
+        feat1,feat2 = imfeatures[i],imfeatures[j]
+        qim1,qim2 = qimages[i],qimages[j]
+        mask1,mask2 = masks[i],masks[j]
+        val = K(feat1,feat2,qim1,qim2,mask1,mask2,\
+                    fore_global_hist,back_global_hist,totalbins,sigma,betas)
+        gram[i,j] = val
+
+
+ocSVM = svm.OneClassSVM(kernel='precomputed',nu=v)
+ocSVM.fit(gram)
+alpha = ocSVM.dual_coef_.flatten()
+support_vecs = ocSVM.support_
+print len(support_vecs)
+
+"""
+#Test unary potentials
+for i in range(20,30):
+    fore,back = get_unary_potentials(testimages[i],rimages,qimages,imfeatures,masks,fore_global_hist,\
+                                back_global_hist,qbins,totalbins,sigma,imtype,\
+                                betas,alpha,support_vecs)
+    plt.figure()
+    plt.imshow(fore-back)
+    plt.colorbar()
+"""
+
+
+"""
 #test histogram fidelities
-
 maxfidelity = 0
 minfidelity = 9999999999999999999999999
 for i in range(n_images):
+    start = time.clock()
     fidelity,fidmap = get_fidelity_to_histogram(qimages[i],masks[i],fore_global_hist,back_global_hist)
+    print "took ", time.clock()-start," seconds"    
     print fidelity
     
     if fidelity > maxfidelity:
@@ -203,7 +337,7 @@ for i in range(n_images):
         plt.imshow(fidmap)
         plt.colorbar()
         cv2.waitKey()
-
+"""
 
 
 #TEST OF THETA KERNEL
@@ -231,6 +365,60 @@ for i in range(n_images):
         if sim > max_sim:
             max_sim = sim
             best_idx = j
+    cv2.imshow("image 1",rimages[i])
+    cv2.imshow("image 2",rimages[best_idx])
+    
+    c = cv2.waitKey()
+    print max_sim
+"""
+
+"""
+#TEST omega2 kernel
+for i in range(n_images):
+    max_sim = 0
+    best_idx = -1
+    bestmap = None
+    
+    for j in range(i+1,n_images):
+        #start = time.clock()
+        sim = omega2(qimages[i],qimages[j],masks[i],masks[j],totalbins)
+        print sim
+        #print time.clock()-start," seconds to compute omega2"
+        if sim > max_sim:
+            max_sim = sim
+            best_idx = j
+    print "Best value is ",max_sim
+    cv2.imshow("image 1",rimages[i])
+    cv2.imshow("image 2",rimages[best_idx])
+    
+    c = cv2.waitKey()
+    print max_sim
+"""
+
+"""
+#fore_global_hist
+#back_global_hist
+#totalbins = int(qbins**3)
+#def K(feat1,feat2,qim1,qim2,mask1,mask2,global_forehist,global_backhist,bins,sigma,beta):
+#TEST K
+for i in range(n_images):
+    max_sim = 0
+    best_idx = -1
+    bestmap = None
+    
+    for j in range(i+1,n_images):
+        start = time.clock()
+        feat1,feat2 = imfeatures[i],imfeatures[j]
+        qim1,qim2 = qimages[i],qimages[j]
+        mask1,mask2 = masks[i],masks[j]
+        sim = K(feat1,feat2,qim1,qim2,mask1,mask2,fore_global_hist,back_global_hist,totalbins,sigma,beta)
+        print sim
+        print time.clock()-start," seconds to compute K"
+        
+        if sim > max_sim:
+            max_sim = sim
+            best_idx = j
+    print "Best value is ",max_sim
     cv2.imshow("image 1",rimages[i])
     cv2.imshow("image 2",rimages[best_idx])
     
