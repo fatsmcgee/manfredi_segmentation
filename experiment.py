@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import os
 import time
 from sklearn import svm
+import maxflow
 
 def mask_from_image(image,imtype):
     if imtype == 'flowers':
@@ -240,6 +241,70 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
     #now compute foreground potentials
     return fore_potential,back_potential
     
+def pixelwise_norms(image):
+    return np.sqrt(image[:,:,0]**2 + image[:,:,1]**2 + image[:,:,2]**2)
+    
+def avg_pixel_difference(rimage):
+    right_diffs = rimage[:,1:,:] - rimage[:,:-1,:]
+    right_dists = pixelwise_norms(right_diffs)
+    
+    bottom_diffs = rimage[1:,:,:] - rimage[:-1,:,:]
+    bottom_dists = pixelwise_norms(bottom_diffs)
+    
+    bottomright_diffs = rimage[1:,1:,:] - rimage[:-1,:-1,:]
+    bottomright_dists = pixelwise_norms(bottomright_diffs)
+    
+    all_dists = np.hstack((right_dists.flat,bottom_dists.flat,bottomright_dists.flat))
+    return np.mean(all_dists)
+    
+    
+def get_argmax_image(rimage,fore_potential,back_potential,lambda_coef):
+    graph = maxflow.Graph[float]()
+    nodeids = graph.add_grid_nodes((rimage.shape[0],rimage.shape[1]))
+    #first add the unary potentials    
+    graph.add_grid_tedges(nodeids,back_potential,fore_potential)
+    
+    sigma = avg_pixel_difference(rimage)
+    #now add the edgewise smoothing potentials    
+    
+    #first, right pointing edges
+    structure = np.zeros((3,3))
+    structure[1,2] = 1
+    weights = np.zeros((rimage.shape[0],rimage.shape[1]))
+    rightdists = pixelwise_norms(rimage[:,1:,:] - rimage[:,:-1,:])
+    weights[:,:-1] = lambda_coef * np.exp(-rightdists/(2*sigma*sigma))
+    graph.add_grid_edges(nodeids, structure=structure, weights=weights)
+    
+    #now, bottom pointing edges
+    structure = np.zeros((3,3))
+    structure[2,1] = 1
+    weights = np.zeros((rimage.shape[0],rimage.shape[1]))
+    bottomdists = pixelwise_norms(rimage[1:,:,:] - rimage[:-1,:,:])
+    weights[:-1,:] = lambda_coef * np.exp(-bottomdists/(2*sigma*sigma))
+    graph.add_grid_edges(nodeids, structure=structure, weights=weights)
+    
+    #finally, bottom-right pointing edges
+    structure = np.zeros((3,3))
+    structure[2,2] = 1
+    weights = np.zeros((rimage.shape[0],rimage.shape[1]))
+    bottomrightdists = pixelwise_norms(rimage[1:,1:,:] - rimage[:-1,:-1,:])
+    weights[:-1,:-1] = lambda_coef * (1/np.sqrt(2))*np.exp(-bottomrightdists/(2*sigma*sigma))
+    graph.add_grid_edges(nodeids, structure=structure, weights=weights)
+    
+    #now get the solution!    
+    graph.maxflow()
+    # Get the segments of the nodes in the grid.
+    sgm = graph.get_grid_segments(nodeids)
+    return sgm
+    
+def measure_sa_accuracy(mask,realmask):
+    return float(np.sum(mask==realmask))/(mask.shape[0]*mask.shape[1])
+    
+def measure_so_accuracy(mask,realmask):
+    both_obj = np.sum(np.logical_and(mask==1,realmask==1))
+    either_obj = np.sum(np.logical_or(mask==1,realmask==1))
+    return float(both_obj)/either_obj
+    
 os.chdir(r"C:\Users\gumpy\Desktop\Class Notes\Advanced Machine Learning\Project\src")
 
 
@@ -253,7 +318,7 @@ imfeatures = []
 imtype = 'flowers' 
 #use a random order of images or load image 1,2,3... in alphabetical dir order
 rand_order = False
-n_images = 200
+n_images = 500
 gram = np.zeros((n_images,n_images))
 #quantization bins per channel
 qbins = 16
@@ -263,11 +328,12 @@ sigma = .25 #try .1, try .01, try .5, try 1
 #start with the Manfredi flowers parameters
 betas = (0.2,1.0,0.16)
 v = .45
+lambda_coef = .24
 
 
 print 'Loading images and test images'
 rimages,masks,_,_ = load_images(imtype,n_images,rand_order)
-testimages,_,_,_ = load_images(imtype,100,rand_order,n_images)
+testimages,testmasks,_,_ = load_images(imtype,200,rand_order,n_images)
 
 print 'Quantizing images'
 qimages = get_quantized_images(rimages,qbins)
@@ -277,11 +343,18 @@ print 'Getting global color histogram'
 fore_global_hist, back_global_hist = get_global_histograms(qimages,masks,totalbins)
 print 'Done'
 
+gram1 = np.load('200Gram.npy')
+
+gram = np.zeros((n_images,n_images))
 
 print 'Computing gram matrix'
 for i in range(n_images):
     print "Row ",i
     for j in range(n_images):
+        if i <200 and j<200:
+            gram[i,j] = gram1[i,j]
+            continue
+        
         feat1,feat2 = imfeatures[i],imfeatures[j]
         qim1,qim2 = qimages[i],qimages[j]
         mask1,mask2 = masks[i],masks[j]
@@ -290,22 +363,54 @@ for i in range(n_images):
         gram[i,j] = val
 
 
+
 ocSVM = svm.OneClassSVM(kernel='precomputed',nu=v)
 ocSVM.fit(gram)
 alpha = ocSVM.dual_coef_.flatten()
 support_vecs = ocSVM.support_
 print len(support_vecs)
 
-"""
+
 #Test unary potentials
-for i in range(20,30):
+total_ims = 0
+total_a_acc = 0.0
+total_o_acc = 0.0
+
+for i in range(len(testimages)):
     fore,back = get_unary_potentials(testimages[i],rimages,qimages,imfeatures,masks,fore_global_hist,\
                                 back_global_hist,qbins,totalbins,sigma,imtype,\
                                 betas,alpha,support_vecs)
-    plt.figure()
+                                
+    rtest = cv2.resize(testimages[i],qimages[0].shape)
+    rtestmask = testmasks[i]
+    
+    amax = get_argmax_image(rtest,fore,back,lambda_coef)
+
+    rmasked = rtest.copy()
+    rmasked[amax==0]/=5
+    
+    a_acc = measure_sa_accuracy(amax,rtestmask)
+    o_acc = measure_so_accuracy(amax,rtestmask)
+    
+    print "s_a Image accuracy is ",a_acc
+    total_a_acc += a_acc
+    total_o_acc += o_acc
+    total_ims+=1
+    print "Average s_a accuracy is ",total_a_acc/total_ims
+    print "Average s_o accuracy is ",total_o_acc/total_ims
+    
+    f1 = plt.figure()
     plt.imshow(fore-back)
     plt.colorbar()
-"""
+    
+    cv2.imshow('Original', rtest)
+    cv2.imshow('Masked image',rmasked)
+    cv2.waitKey()
+    plt.close(f1)
+
+    #plt.close(f2)
+    
+
 
 
 """
