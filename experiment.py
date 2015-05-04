@@ -231,26 +231,40 @@ def get_partial_kernels(n_images,rowstart,rowend,imfeatures,qimages,masks\
 
 def get_all_kernels(n_processes,n_images,imfeatures,qimages,masks\
                     ,fore_global_hist,back_global_hist,totalbins,sigma,betas):
-    for p in range(n_processes):
-            jobs = []
-            rowstarts = []
-            chunk_size = int(n_images/n_processes)
-            for rs in range(0,n_images,chunk_size):
-                rowstarts.append(rs)
-                rowend = min(rs+chunk_size-1,n_images-1)
-                
-                args = (n_images,rs,rowend,imfeatures,qimages,masks,\
-                            fore_global_hist,back_global_hist,totalbins,sigma,betas)
-                proc = multiprocessing.Process(target=get_partial_kernels, args=args)
-                jobs.append(proc)
-                proc.start()
-            for proc in jobs:
-                proc.join()
-            #now join the resulting matrices
-            part_grams = tuple(np.load('subkernels{0}.npy'.format(rs)) for rs in rowstarts)
-            kernels = np.vstack(part_grams)
+
+    jobs = []
+    rowstarts = []
+    chunk_size = int(n_images/n_processes)
+    for rs in range(0,n_images,chunk_size):
+        rowstarts.append(rs)
+        rowend = min(rs+chunk_size-1,n_images-1)
+            
+        args = (n_images,rs,rowend,imfeatures,qimages,masks,\
+                fore_global_hist,back_global_hist,totalbins,sigma,betas)
+        proc = multiprocessing.Process(target=get_partial_kernels, args=args)
+        jobs.append(proc)
+        proc.start()
+        
+    for proc in jobs:
+        proc.join()
+        #now join the resulting matrices
+    part_grams = tuple(np.load('subkernels{0}.npy'.format(rs)) for rs in rowstarts)
+    kernels = np.vstack(part_grams)
+    
     np.save('kernels.npy',kernels)
     return kernels
+    
+#used for crossvalidating over simga
+#theta is very inexpensive to replace    
+def replace_theta(kernels,newsigma):
+    n_images = kernels.shape[0]
+    newkernels = kernels.copy()
+    
+    for i in range(n_images):
+        for j in range(n_images):
+            newkernels[:,:,0] = theta(imfeatures[i],imfeatures[j],newsigma)
+            
+    return newkernels
     
 def get_graham_matrix(kernels,betas):
     theta = kernels[:,:,0]
@@ -301,7 +315,7 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         support_fore += betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
         support_fore += betas[2] * pf3ip_test * gammas[i]
         support_fore *= support_theta
-        support_fore *= alpha[idx]
+        support_fore *= alpha[i]
         fore_potential += support_fore
         
         #support_back = np.zeros(rtest.shape)
@@ -309,7 +323,7 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         support_back += betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
         support_back += betas[2] * pb3ip_test * gammas[i]
         support_back *= support_theta
-        support_back *= alpha[idx]
+        support_back *= alpha[i]
         back_potential += support_back
         
     #now compute foreground potentials
@@ -381,13 +395,6 @@ def measure_so_accuracy(mask,realmask,labeled):
     return float(np.sum(both_obj))/np.sum(either_obj)
 
 if __name__ == '__main__':    
-    os.chdir(r"C:\Users\gumpy\Desktop\Class Notes\Advanced Machine Learning\Project\src")
-    
-    images = []
-    rimages = []
-    qimages = []
-    masks = []
-    imfeatures = []
     
     #flowers or pedestrians
     imtype = 'flowers' 
@@ -395,8 +402,10 @@ if __name__ == '__main__':
     #choose an arbitrary seed so we get the same behavior each time
     np.random.seed(10)
     rand_order = True
-    n_images = 150
-    n_testimages = 100
+    #cfc
+    interactive = True
+    n_images = 600
+    n_testimages = 229
     gram = np.zeros((n_images,n_images))
     #quantization bins per channel
     qbins = 16
@@ -407,6 +416,7 @@ if __name__ == '__main__':
     betas = (0.2,1.0,0.16)
     v = .45
     lambda_coef = .24
+    #cfc
     n_processes = 4
     
     
@@ -426,12 +436,13 @@ if __name__ == '__main__':
     print 'Done'
     
 
-    kernels = get_all_kernels(n_processes,n_images,imfeatures,qimages,masks\
-                    ,fore_global_hist,back_global_hist,totalbins,sigma,betas)
-    #kernels = np.load('kernels.npy')
+    
+    #kernels = get_all_kernels(n_processes,n_images,imfeatures,qimages,masks\
+     #               ,fore_global_hist,back_global_hist,totalbins,sigma,betas)
+    kernels = np.load('600KERNEL.npy')
     
     gram = get_graham_matrix(kernels,betas)
-
+    #gram = np.load('600GRAMNORAND.npy')
      
     ocSVM = svm.OneClassSVM(kernel='precomputed',nu=v)
     ocSVM.fit(gram)
@@ -473,136 +484,19 @@ if __name__ == '__main__':
         print "Average s_a accuracy is ",total_a_acc/total_ims
         print "Average s_o accuracy is ",total_o_acc/total_ims
         
-        f1 = plt.figure()
-        plt.imshow(fore-back)
-        plt.colorbar()
-        
-        cv2.imshow('Original', rtest)
-        cv2.imshow('Argmax Masked image',rmasked)
-        cv2.imshow('Ground Truth Masked Image',rgroundtruth)
-        
-        cv2.waitKey()
-        plt.close(f1)
+        if interactive:
+            f1 = plt.figure()
+            plt.imshow(fore-back)
+            plt.colorbar()
+    
+            cv2.imshow('Original', rtest)
+            cv2.imshow('Argmax Masked image',rmasked)
+            cv2.imshow('Ground Truth Masked Image',rgroundtruth)
+            
+            cv2.waitKey()
+            plt.close(f1)
     
         #plt.close(f2)
     
     
     
-    
-    """
-    #test histogram fidelities
-    maxfidelity = 0
-    minfidelity = 9999999999999999999999999
-    for i in range(n_images):
-        start = time.clock()
-        fidelity,fidmap = get_fidelity_to_histogram(qimages[i],masks[i],fore_global_hist,back_global_hist)
-        print "took ", time.clock()-start," seconds"    
-        print fidelity
-        
-        if fidelity > maxfidelity:
-            print "max fidelity is  now", fidelity
-            maxfidelity = fidelity
-            cv2.imshow("High Fidelity",rimages[i])
-            
-            plt.close()
-            plt.imshow(fidmap)
-            plt.colorbar()
-            
-            cv2.waitKey()
-        if fidelity < minfidelity:
-            print "min fidelity is  now", fidelity
-            minfidelity = fidelity
-            cv2.imshow("Low Fidelity",rimages[i])
-            
-            plt.close()
-            plt.imshow(fidmap)
-            plt.colorbar()
-            cv2.waitKey()
-    """
-    
-    
-    #TEST OF THETA KERNEL
-    """
-    for i in range(n_images):
-        max_sim = 0
-        best_idx = -1
-        for j in range(i+1,n_images):
-            sim = theta(imfeatures[i],imfeatures[j],sigma)
-            if sim > max_sim:
-                max_sim = sim
-                best_idx = j
-        cv2.imshow("image 1",rimages[i])
-        cv2.imshow("image 2",rimages[best_idx])
-        c = cv2.waitKey()
-    """
-    
-    #TEST omega1 kernel
-    """
-    for i in range(n_images):
-        max_sim = 0
-        best_idx = -1
-        for j in range(i+1,n_images):
-            sim = omega1(masks[i],masks[j])
-            if sim > max_sim:
-                max_sim = sim
-                best_idx = j
-        cv2.imshow("image 1",rimages[i])
-        cv2.imshow("image 2",rimages[best_idx])
-        
-        c = cv2.waitKey()
-        print max_sim
-    """
-    
-    """
-    #TEST omega2 kernel
-    for i in range(n_images):
-        max_sim = 0
-        best_idx = -1
-        bestmap = None
-        
-        for j in range(i+1,n_images):
-            #start = time.clock()
-            sim = omega2(qimages[i],qimages[j],masks[i],masks[j],totalbins)
-            print sim
-            #print time.clock()-start," seconds to compute omega2"
-            if sim > max_sim:
-                max_sim = sim
-                best_idx = j
-        print "Best value is ",max_sim
-        cv2.imshow("image 1",rimages[i])
-        cv2.imshow("image 2",rimages[best_idx])
-        
-        c = cv2.waitKey()
-        print max_sim
-    """
-    
-    """
-    #fore_global_hist
-    #back_global_hist
-    #totalbins = int(qbins**3)
-    #def K(feat1,feat2,qim1,qim2,mask1,mask2,global_forehist,global_backhist,bins,sigma,beta):
-    #TEST K
-    for i in range(n_images):
-        max_sim = 0
-        best_idx = -1
-        bestmap = None
-        
-        for j in range(i+1,n_images):
-            start = time.clock()
-            feat1,feat2 = imfeatures[i],imfeatures[j]
-            qim1,qim2 = qimages[i],qimages[j]
-            mask1,mask2 = masks[i],masks[j]
-            sim = K(feat1,feat2,qim1,qim2,mask1,mask2,fore_global_hist,back_global_hist,totalbins,sigma,beta)
-            print sim
-            print time.clock()-start," seconds to compute K"
-            
-            if sim > max_sim:
-                max_sim = sim
-                best_idx = j
-        print "Best value is ",max_sim
-        cv2.imshow("image 1",rimages[i])
-        cv2.imshow("image 2",rimages[best_idx])
-        
-        c = cv2.waitKey()
-        print max_sim
-    """
