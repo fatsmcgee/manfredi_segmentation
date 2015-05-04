@@ -404,7 +404,7 @@ def measure_so_accuracy(mask,realmask,labeled):
 
 def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
-                        sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive=False,log=False):
+                        sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive=False,log_dir=False):
          
     total_a_acc,total_o_acc,total_ims = 0,0,0                   
     for i in range(len(testimages)):
@@ -428,7 +428,7 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
         
        
         
-        if interactive or log:
+        if interactive or log_dir:
             print "Testing on test image",i
             print "s_a Image accuracy is ",a_acc
             print "s_o Image accuracy is ",o_acc
@@ -452,9 +452,9 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                 cv2.waitKey()
                 plt.close(f1)
                 
-            if log:
-                cv2.imwrite('test_amax{0}.png'.format(i),rmasked)
-                cv2.imwrite('test_truth{0}.png'.format(i),rgroundtruth)
+            if log_dir:
+                cv2.imwrite(os.path.join(log_dir,'test_amax{0}.png'.format(i)),rmasked)
+                cv2.imwrite(os.path.join(log_dir,'test_truth{0}.png'.format(i)),rgroundtruth)
             
             
     avg_a_acc = total_a_acc/total_ims
@@ -513,7 +513,16 @@ def cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
     for lambda_c in trial_lambdas:
         q = Queue()
         l_qs.append(q)
-        args = make_args(betas,lambda_coef,q)
+        args = make_args(betas,lambda_c,q)
+        proc = multiprocessing.Process(target=get_test_accuracy_worker, args=args)
+        jobs.append(proc)
+        proc.start()
+        
+    nu_qs = []
+    for new_nu in trial_nus:
+        q = Queue()
+        l_qs.append(q)
+        args = make_args(betas,lambda_c,q)
         proc = multiprocessing.Process(target=get_test_accuracy_worker, args=args)
         jobs.append(proc)
         proc.start()
@@ -542,11 +551,118 @@ def cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
     
     return best_b1,best_b3,best_lambda
 
-def run_experiment():
-    pass
+#imtype is either 'flowers' or 'horses' 
+#n_procs is number of simulatneous processes to run on your machine
+#ntrain is number of images to use for training, ditto for test and validation
+#interactive=True if you want to see argmax test results, otherwise False
+def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
+    
+    seed = int(time.time())
+    np.random.seed(seed)
+    print "Seed is ", seed
+    rand_order = True
+    #cfc
+    n_images = ntrain
+    n_validimages = nvalid
+    n_testimages = ntest
+
+    #quantization bins per channel
+    #TO start off, we will use this for all types
+    qbins = 16
+    totalbins = int(qbins**3)
+    
+    #Also seems to work well in general, but may ultimately cross validate
+    sigma = .25 
+    
+    if imtype=='flowers':
+    #start with the Manfredi flowers parameters
+        betas = (0.2,1.0,0.16)
+        nu = .45
+        lambda_coef = .24
+        
+    elif imtype=='horses':
+        betas = (.28,1.0,0.05)
+        nu = 0.24
+        lambda_coef = 0.18
+        
+        #coefficients to cross validate over
+        trial_beta1s = [.14,.21,.28,.35,.42]
+        trial_beta3s = [.01,.02,.05,.08,.11]
+        trial_lambdas = [.05,.12,.18,.25,.32,.5]
+        trial_nus = [.07,.14,.2,.27,.34]
+    
+    print 'Loading images and test images'
+    impaths,maskpaths = get_image_paths(imtype,rand_order)
+    
+    allimages,allmasks,all_labels = load_images(imtype,n_images+n_testimages+n_validimages,impaths,maskpaths)
+    
+    #training images,masks
+    rimages,masks = allimages[:n_images], allmasks[:n_images]
+    
+    #test images, masks, labels
+    start_idx,end_idx = n_images,n_images+n_testimages
+    testimages,testmasks,testlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
+    
+    #validation images, masks, labels
+    start_idx,end_idx = n_images+n_testimages,n_images+n_testimages+n_validimages
+    validimages,validmasks,validlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
+    
+    print 'Quantizing images'
+    qimages = get_quantized_images(rimages,qbins)
+    print 'Extracting image features'
+    imfeatures = get_image_features(rimages,imtype)
+    print 'Getting global color histogram'
+    fore_global_hist, back_global_hist = get_global_histograms(qimages,masks,totalbins)
+
+    print 'Getting kernels'    
+    kernels = get_all_kernels(n_procs,n_images,imfeatures,qimages,masks\
+                    ,fore_global_hist,back_global_hist,totalbins,sigma)
+    
+    #kernels = np.load('600KERNEL.npy')
+    #kernels = replace_theta(kernels,imfeatures,sigma)
+    print 'Getting gram'
+    gram = get_graham_matrix(kernels,betas)
+    #gram = np.load('600GRAMNORAND.npy')
+     
+    print 'Training OC SVM'
+    ocSVM = svm.OneClassSVM(kernel='precomputed',nu=nu)
+    ocSVM.fit(gram)
+    alpha = ocSVM.dual_coef_.flatten()
+    support_vecs = ocSVM.support_
+
+    print 'Cross validating'
+    #cross validate to find the best values of beta 1, beta 3, and lambda    
+    beta1,beta3,new_lambda_coef = cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
+                                    imfeatures,masks,fore_global_hist,back_global_hist,\
+                                    qbins,totalbins,sigma,lambda_coef,kernels,imtype,betas,alpha,\
+                                    support_vecs, trial_beta1s,trial_beta3s,trial_lambdas)
+    
+    betas = (beta1,betas[1],beta3)
+    lambda_coef = new_lambda_coef
+    print "After cross validating, choice of betas are",betas
+    print "After cross validating, choice of lambda is",lambda_coef
+    
+    log_dir = "testlog_" + str(seed)
+    os.mkdir(log_dir)
+    
+    print 'Getting test accuracy'
+    o_acc,a_acc = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
+                        fore_global_hist,back_global_hist,qbins,totalbins,\
+                        sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive,log_dir)
+    
+    log_f = open(os.path.join(log_dir,'results.txt'),'w')
+    log_f.write("Betas chosen were {0}\n".format(str(betas)))
+    log_f.write("lambda chosen was {0}\n".format(str(lambda_coef)))
+    log_f.write("nu chosen was {0}\n".format(str(nu)))
+    log_f.write("s_o accuracy average is {0}\n".format(o_acc))
+    log_f.write("s_a accuracy average is {0}\n".format(a_acc))
+    log_f.close()
 
 if __name__ == '__main__':    
+    #imtype, number of processors, training images, test images, valid images, interactive mode
+    run_experiment('horses',4,10,10,10,False)
     
+if 0==1:
     #flowers or horses or cats
     imtype = 'horses'
     #use a random order of images or load image 1,2,3... in alphabetical dir order
@@ -575,6 +691,10 @@ if __name__ == '__main__':
         betas = (.28,1.0,0.05)
         v = 0.24
         lambda_coef = 0.18
+        
+        trial_beta1s = [.14,.21,.28,.35,.42]
+        trial_beta3s = [.01,.02,.05,.08,.11]
+        trial_lambdas = [.05,.12,.18,.25,.32,.5]
     #cfc
     n_procs = 4
     
@@ -603,8 +723,6 @@ if __name__ == '__main__':
     fore_global_hist, back_global_hist = get_global_histograms(qimages,masks,totalbins)
     print 'Done'
     
-
-    
     kernels = get_all_kernels(n_procs,n_images,imfeatures,qimages,masks\
                     ,fore_global_hist,back_global_hist,totalbins,sigma)
     
@@ -618,10 +736,6 @@ if __name__ == '__main__':
     ocSVM.fit(gram)
     alpha = ocSVM.dual_coef_.flatten()
     support_vecs = ocSVM.support_
-    
-    trial_beta1s = [.1,.2,.3]
-    trial_beta3s = [.01,.05,.1]
-    trial_lambdas = [.1,.2]
 
     #cross validate to find the best values of beta 1, beta 3, and lambda    
     beta1,beta3,new_lambda_coef = cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
