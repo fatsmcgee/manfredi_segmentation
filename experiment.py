@@ -14,6 +14,8 @@ def mask_from_image(image,imtype):
         return np.logical_and(image[:,:,2]==128,image[:,:,1]==0)
     elif imtype == 'horses':
         return image[:,:,0]>128
+    elif imtype == 'pedestrians':
+        return image[:,:,0]>0
 
 def get_image_paths(imtype,randorder=False):  
     i_m_fs = []
@@ -32,6 +34,13 @@ def get_image_paths(imtype,randorder=False):
         im_fs = ['../horse_images/' + f for f in im_fs]
         i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
         
+    elif imtype == 'pedestrians':
+        im_fs = os.listdir("../pedestrian_images")
+        m_fs = ['../pedestrian_segments/' + f for f in im_fs]
+        im_fs = ['../pedestrian_images/' + f for f in im_fs]
+                                
+        i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
+        
     #ensures same behavior on windows/nix
     i_m_fs = sorted(i_m_fs,key= lambda t:t[0])
     if randorder:
@@ -39,7 +48,7 @@ def get_image_paths(imtype,randorder=False):
         
     return [t[0] for t in i_m_fs], [t[1] for t in i_m_fs]
     
-#1. rimages,masks = load_images('flowers',100)
+#1. rimages,masks,labeled = load_images('flowers',100)
 def load_images(imtype,n,impaths,maskpaths):
     
     rimages = []
@@ -49,6 +58,9 @@ def load_images(imtype,n,impaths,maskpaths):
     
     if imtype == 'flowers' or imtype == 'horses':
         newsize = (256,256)
+        
+    elif imtype == 'pedestrians':
+        newsize = (128,256)
         
     for im_f,m_f in zip(impaths,maskpaths)[:n]:
         im = cv2.imread(im_f)
@@ -113,14 +125,31 @@ def get_manfredi_hog_features(image):
     
     descriptor = cv2.HOGDescriptor(winSize,blockSize,blockStride,cellSize,bins)
     return descriptor.compute(image).flatten()
+    
+def get_pedestrian_hog_features(image):
+    rows,cols,_ = image.shape
+    
+    winSize = (cols,rows)
+    
+    #(64-40)%24 ==0 yes
+    #(128-48)%80
+    blockSize = (80,160)
+    blockStride = (48,96)
+    cellSize = (16,16)
+    bins = 9
+    
+    descriptor = cv2.HOGDescriptor(winSize,blockSize,blockStride,cellSize,bins)
+    d= descriptor.compute(image).flatten()
+    return d
   
 def get_image_feature(rimage,imtype):
     if imtype == 'flowers' or imtype=='horses':
         return get_manfredi_hog_features(rimage)
+    elif imtype == 'pedestrians':
+        return get_pedestrian_hog_features(rimage)
         
 def get_image_features(rimages, imtype):
-    if imtype == 'flowers' or imtype == 'horses':
-        return [get_image_feature(i,imtype) for i in rimages]
+    return [get_image_feature(i,imtype) for i in rimages]
 
     
 def get_image_histogram(qimage,mask,bins,regularize=False):
@@ -260,7 +289,7 @@ def get_all_kernels(n_processes,n_images,imfeatures,qimages,masks\
     return kernels
     
 #used for crossvalidating over simga
-#theta is very inexpensive to replace    
+#theta relatively inexpensive to replace, but still takes a while 
 def replace_theta(kernels,imfeatures,newsigma):
     n_images = kernels.shape[0]
     newkernels = kernels.copy()
@@ -280,7 +309,7 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
                             global_backhist,qbins,totalbins,sigma,imtype,\
                             betas,alpha,support_vecs):
     #first resize test image to the correct size and gather features
-    rtest = cv2.resize(testimg,qimages[0].shape)
+    rtest = cv2.resize(testimg,(qimages[0].shape[1],qimages[0].shape[0]))
     qtest = get_quantized_image(rtest,qbins)
     feattest = get_image_feature(rtest,imtype)
     #based on test image (j) compared to each support vector image-mask (i)
@@ -299,6 +328,10 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
     
     fore_potential = np.zeros(qtest.shape)    
     back_potential = np.zeros(qtest.shape)
+    
+    fore_beta1 = np.zeros(qtest.shape)  
+    fore_beta2 = np.zeros(qtest.shape)  
+    fore_beta3 = np.zeros(qtest.shape)  
     
     #get infomation for each support vector
     for i,idx in enumerate(support_vecs):
@@ -322,6 +355,11 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         support_fore = betas[0]*masks[idx]
         support_fore += betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
         support_fore += betas[2] * pf3ip_test * gammas[i]
+        
+        fore_beta1 += betas[0]*masks[idx]
+        fore_beta2 += betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
+        fore_beta3 += betas[2] * pf3ip_test * gammas[i]
+        
         support_fore *= support_theta
         support_fore *= alpha[i]
         fore_potential += support_fore
@@ -330,12 +368,17 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         support_back = betas[0]*(1-masks[idx])
         support_back += betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
         support_back += betas[2] * pb3ip_test * gammas[i]
+        
+        fore_beta1 -= betas[0]*(1-masks[idx])
+        fore_beta2 -= betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
+        fore_beta3 -= betas[2] * pb3ip_test * gammas[i]
+        
         support_back *= support_theta
         support_back *= alpha[i]
         back_potential += support_back
         
     #now compute foreground potentials
-    return fore_potential,back_potential
+    return fore_potential,back_potential,fore_beta1,fore_beta2,fore_beta3
     
 def pixelwise_norms(image):
     return np.sqrt(image[:,:,0]**2 + image[:,:,1]**2 + image[:,:,2]**2)
@@ -406,14 +449,17 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive=False,log_dir=False):
          
-    total_a_acc,total_o_acc,total_ims = 0,0,0                   
+    total_a_acc,total_o_acc,total_ims = 0,0,0      
+    a_accs = []
+    o_accs = []             
     for i in range(len(testimages)):
 
-        fore,back = get_unary_potentials(testimages[i],rimages,qimages,imfeatures,masks,fore_global_hist,\
+        fore,back,b1,b2,b3 = get_unary_potentials(testimages[i],rimages,qimages,imfeatures,masks,fore_global_hist,\
                                     back_global_hist,qbins,totalbins,sigma,imtype,\
                                     betas,alpha,support_vecs)
                                     
-        rtest = cv2.resize(testimages[i],qimages[0].shape)
+        newsize = (qimages[0].shape[1],qimages[0].shape[0])
+        rtest = cv2.resize(testimages[i],newsize)
         rtestmask = testmasks[i]
         rtestlabeled = testlabels[i]
         
@@ -421,6 +467,8 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
         
         a_acc = measure_sa_accuracy(amax,rtestmask,rtestlabeled)
         o_acc = measure_so_accuracy(amax,rtestmask,rtestlabeled)
+        a_accs.append(a_acc)
+        o_accs.append(o_acc)
                 
         total_a_acc += a_acc
         total_o_acc += o_acc
@@ -445,12 +493,19 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                 plt.imshow(fore-back)
                 plt.colorbar()
                 
+                f2 = plt.figure()
+                plt.imshow(b1)
+                f3 = plt.figure()
+                plt.imshow(b2)
+                f4 = plt.figure()
+                plt.imshow(b3)
+                
                 cv2.imshow('Original', rtest)
                 cv2.imshow('Argmax Masked image',rmasked)
                 cv2.imshow('Ground Truth Masked Image',rgroundtruth)
                 
                 cv2.waitKey()
-                plt.close(f1)
+                [plt.close(f) for f in [f1,f2,f3,f4]]
                 
             if log_dir:
                 cv2.imwrite(os.path.join(log_dir,'test_amax{0}.png'.format(i)),rmasked)
@@ -460,13 +515,13 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
     avg_a_acc = total_a_acc/total_ims
     avg_o_acc = total_o_acc/total_ims
     
-    return avg_a_acc,avg_o_acc
+    return avg_a_acc,avg_o_acc,np.median(a_accs),np.median(o_accs)
     
 def get_test_accuracy_worker(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs,queue):
                             
-    a_acc,o_acc = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
+    a_acc,o_acc,_,_ = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs)
     #validation accuracy given by average of s_o and s_a
@@ -475,81 +530,111 @@ def get_test_accuracy_worker(testimages,testmasks,testlabels,rimages,qimages,imf
 
 def cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
                         imfeatures,masks,fore_global_hist,back_global_hist,\
-                        qbins,totalbins,sigma,lambda_coef,imtype,betas,alpha,\
-                        support_vecs, trial_beta1s,trial_beta3s,trial_lambdas):
-    jobs = []
+                        qbins,totalbins,sigma,lambda_coef,nu,kernels,imtype,betas,\
+                        trial_beta1s,trial_beta3s,trial_lambdas,trial_nus):
+              
+              
+    #changing only beta1
+    beta1_configs = [((beta1,betas[1],betas[2]),lambda_coef,nu) for beta1 in trial_beta1s]
+    beta1_idxs = range(len(trial_beta1s))
+    
+    #changing only beta3
+    beta3_configs = [((betas[0],betas[1],beta3),lambda_coef,nu) for beta3 in trial_beta3s]
+    beta3_idxs = range(beta1_idxs[-1]+1, beta1_idxs[-1]+1 + len(trial_beta3s))
+    
+    #changing only lambda
+    lambda_configs = [(betas,lambda_c,nu) for lambda_c in trial_lambdas]
+    lambda_idxs = range(beta3_idxs[-1]+1, beta3_idxs[-1]+1 + len(trial_lambdas))
+    
+    #changing only nu
+    nu_configs = [(betas,lambda_coef,new_nu) for new_nu in trial_nus]
+    nu_idxs = range(lambda_idxs[-1]+1, lambda_idxs[-1]+1 + len(trial_nus))
+    
+    all_configs = beta1_configs + beta3_configs + lambda_configs + nu_configs
 
     """
     (testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs,queue):
     """
-    def make_args(betas,lambda_coef,q):
+    def make_args(betas,lambda_coef,q,alpha,support_vecs):
         return (validimages,validmasks,validlabels,rimages,qimages,imfeatures,masks\
                     ,fore_global_hist,back_global_hist,qbins,totalbins,\
                     sigma,lambda_coef,imtype,betas,alpha,support_vecs,q)
-                    
-    b1_qs = []
-    for beta1 in trial_beta1s:
-        q = Queue()
-        b1_qs.append(q)
-        t_betas = (beta1,betas[1],betas[2])
-        args = make_args(t_betas,lambda_coef,q)
-        proc = multiprocessing.Process(target=get_test_accuracy_worker, args=args)
-        jobs.append(proc)
-        proc.start()
-        
-    b3_qs = []
-    for beta3 in trial_beta3s:
-        q = Queue()
-        b3_qs.append(q)
-        t_betas = (betas[0],betas[1],beta3)
-        args = make_args(t_betas,lambda_coef,q)
-        proc = multiprocessing.Process(target=get_test_accuracy_worker, args=args)
-        jobs.append(proc)
-        proc.start()
+     
+    jobs = []
+    job_qs = []
+    alphas = []
+    support_vec_arr = []
     
-    l_qs = []
-    for lambda_c in trial_lambdas:
+    for trial_betas,trial_lambda,trial_nu in all_configs:
         q = Queue()
-        l_qs.append(q)
-        args = make_args(betas,lambda_c,q)
+        job_qs.append(q)
+        #kernels = np.load('600KERNEL.npy')
+        #kernels = replace_theta(kernels,imfeatures,sigma)
+        print 'Getting gram'
+        gram = get_graham_matrix(kernels,trial_betas)
+        #gram = np.load('600GRAMNORAND.npy')
+         
+        print 'Training OC SVM'
+        ocSVM = svm.OneClassSVM(kernel='precomputed',nu=trial_nu)
+        ocSVM.fit(gram)
+        
+        alpha = ocSVM.dual_coef_.flatten()
+        alphas.append(alpha)
+        support_vecs = ocSVM.support_
+        support_vec_arr.append(support_vecs)
+        
+        args = make_args(trial_betas,trial_lambda,q,alpha,support_vecs)
+        
         proc = multiprocessing.Process(target=get_test_accuracy_worker, args=args)
         jobs.append(proc)
         proc.start()
-        
-    nu_qs = []
-    for new_nu in trial_nus:
-        q = Queue()
-        l_qs.append(q)
-        args = make_args(betas,lambda_c,q)
-        proc = multiprocessing.Process(target=get_test_accuracy_worker, args=args)
-        jobs.append(proc)
-        proc.start()
-        
+                                
     for proc in jobs:
         proc.join()
-        #now join the resulting matrices
     
-    b1_accs = [q.get() for q in b1_qs]
-    b3_accs = [q.get() for q in b3_qs]
-    l_accs = [q.get() for q in l_qs]
     
-    for b1,b1_acc in zip(trial_beta1s,b1_accs):
-        print "Accuracy of beta_1 ",b1," is ",b1_acc
+    accs = [q.get() for q in job_qs]
     
-    for b3,b3_acc in zip(trial_beta3s,b3_accs):
-        print "Accuracy of beta_3  ",b3," is ",b3_acc
+    for config,acc in zip(all_configs,accs):
+        print "With betas",config[0],"lambda",config[1],"and nu",config[2]
+        print "Accuracy is ",acc
         
-    for l,l_acc in zip(trial_lambdas,l_accs):
-        print "Accuracy of lambda ",l," is ",l_acc
-    #get the best beta1,beta3, and lambda
-        
-    best_b1 = max(zip(trial_beta1s,b1_accs), key=lambda t:t[1])[0]
-    best_b3 = max(zip(trial_beta3s,b3_accs), key=lambda t:t[1])[0]
-    best_lambda = max(zip(trial_lambdas,l_accs), key=lambda t:t[1])[0]
+    best_beta1idx = max([t for t in enumerate(accs) if t[0] in beta1_idxs],\
+                        key = lambda t:t[1])[0]
+    best_beta1 = all_configs[best_beta1idx][0][0]
     
-    return best_b1,best_b3,best_lambda
+    best_beta3idx = max([t for t in enumerate(accs) if t[0] in beta3_idxs],\
+                        key = lambda t:t[1])[0]
+    best_beta3 = all_configs[best_beta3idx][0][2]
+    
+    best_lambdaidx = max([t for t in enumerate(accs) if t[0] in lambda_idxs],\
+                        key = lambda t:t[1])[0]
+    best_lambda = all_configs[best_lambdaidx][1]
+    
+    best_nuidx = max([t for t in enumerate(accs) if t[0] in nu_idxs],\
+                        key = lambda t:t[1])[0]
+    best_nu = all_configs[best_nuidx][2]
+    
+    best_betas = (best_beta1,betas[1],best_beta3)
+    
+    print "Best betas are",best_betas,"and best lambda is",best_lambda,\
+            "and best nu is",best_nu
+    
+    
+    gram = get_graham_matrix(kernels,best_betas)
+    
+    print 'Training final model'
+    ocSVM = svm.OneClassSVM(kernel='precomputed',nu=best_nu)
+    ocSVM.fit(gram)
+        
+    alpha = ocSVM.dual_coef_.flatten()
+    alphas.append(alpha)
+    support_vecs = ocSVM.support_
+    support_vec_arr.append(support_vecs)
+    
+    return best_betas,best_lambda,support_vecs,alpha,best_nu
 
 #imtype is either 'flowers' or 'horses' 
 #n_procs is number of simulatneous processes to run on your machine
@@ -579,6 +664,10 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
         betas = (0.2,1.0,0.16)
         nu = .45
         lambda_coef = .24
+        trial_beta1s = [.07,.15,.20,.27,.34]
+        trial_beta3s = [.05,.10,.16,.21,.26]
+        trial_lambdas = [.08,.16,.24,.32,.40]
+        trial_nus = [.15,.30,.45,.60,.75]
         
     elif imtype=='horses':
         betas = (.28,1.0,0.05)
@@ -590,6 +679,18 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
         trial_beta3s = [.01,.02,.05,.08,.11]
         trial_lambdas = [.05,.12,.18,.25,.32,.5]
         trial_nus = [.07,.14,.2,.27,.34]
+        
+    elif imtype=='pedestrians':
+    #start with the Manfredi flowers parameters
+        betas = (.24,1.0,.11)
+        nu = .36
+        lambda_coef = .05
+        
+        trial_beta1s = [.5,.7]
+        trial_beta3s = [.2,.4]
+        trial_lambdas = [.2,.3,.4]
+        trial_nus = [.28,.44]
+        sigma = 1
     
     print 'Loading images and test images'
     impaths,maskpaths = get_image_paths(imtype,rand_order)
@@ -618,35 +719,23 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
     kernels = get_all_kernels(n_procs,n_images,imfeatures,qimages,masks\
                     ,fore_global_hist,back_global_hist,totalbins,sigma)
     
-    #kernels = np.load('600KERNEL.npy')
-    #kernels = replace_theta(kernels,imfeatures,sigma)
-    print 'Getting gram'
-    gram = get_graham_matrix(kernels,betas)
-    #gram = np.load('600GRAMNORAND.npy')
-     
-    print 'Training OC SVM'
-    ocSVM = svm.OneClassSVM(kernel='precomputed',nu=nu)
-    ocSVM.fit(gram)
-    alpha = ocSVM.dual_coef_.flatten()
-    support_vecs = ocSVM.support_
-
+    
     print 'Cross validating'
     #cross validate to find the best values of beta 1, beta 3, and lambda    
-    beta1,beta3,new_lambda_coef = cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
+    betas,lambda_coef,support_vecs,alpha,nu = cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
                                     imfeatures,masks,fore_global_hist,back_global_hist,\
-                                    qbins,totalbins,sigma,lambda_coef,kernels,imtype,betas,alpha,\
-                                    support_vecs, trial_beta1s,trial_beta3s,trial_lambdas)
+                                    qbins,totalbins,sigma,lambda_coef,nu,kernels,imtype,betas,\
+                                    trial_beta1s,trial_beta3s,trial_lambdas,trial_nus)
     
-    betas = (beta1,betas[1],beta3)
-    lambda_coef = new_lambda_coef
     print "After cross validating, choice of betas are",betas
     print "After cross validating, choice of lambda is",lambda_coef
+    print "After cross validating, choice of nu is",nu
     
-    log_dir = "testlog_" + str(seed)
+    log_dir = imtype+ "_testlog_" + str(seed)
     os.mkdir(log_dir)
     
     print 'Getting test accuracy'
-    o_acc,a_acc = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
+    a_acc,o_acc,med_a,med_o = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive,log_dir)
     
@@ -656,102 +745,18 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
     log_f.write("nu chosen was {0}\n".format(str(nu)))
     log_f.write("s_o accuracy average is {0}\n".format(o_acc))
     log_f.write("s_a accuracy average is {0}\n".format(a_acc))
+    log_f.write("s_o accuracy median is {0}\n".format(med_o))
+    log_f.write("s_a accuracy median is {0}\n".format(med_a))
     log_f.close()
+    
+    np.save(os.path.join(log_dir,"svecs.npy"),support_vecs)
+    np.save(os.path.join(log_dir,"alpha.npy"),alpha)
+    np.save(os.path.join(log_dir,"kernels.npy"),kernels)
 
 if __name__ == '__main__':    
     #imtype, number of processors, training images, test images, valid images, interactive mode
-    run_experiment('horses',4,10,10,10,False)
-    
-if 0==1:
-    #flowers or horses or cats
-    imtype = 'horses'
-    #use a random order of images or load image 1,2,3... in alphabetical dir order
-    #choose an arbitrary seed so we get the same behavior each time
-    np.random.seed(20)
-    rand_order = True
-    #cfc
-    interactive = False
-    n_images = 50
-    n_validimages = 50
-    n_testimages = 50
-    gram = np.zeros((n_images,n_images))
-    #quantization bins per channel
-    qbins = 16
-    totalbins = int(qbins**3)
-    
-    sigma = .25 #seems to work well in general, but may change
-    
-    if imtype=='flowers':
-    #start with the Manfredi flowers parameters
-        betas = (0.2,1.0,0.16)
-        v = .45
-        lambda_coef = .24
-        
-    elif imtype=='horses':
-        betas = (.28,1.0,0.05)
-        v = 0.24
-        lambda_coef = 0.18
-        
-        trial_beta1s = [.14,.21,.28,.35,.42]
-        trial_beta3s = [.01,.02,.05,.08,.11]
-        trial_lambdas = [.05,.12,.18,.25,.32,.5]
-    #cfc
-    n_procs = 4
-    
-    
-    print 'Loading images and test images'
-    impaths,maskpaths = get_image_paths(imtype,rand_order)
-    
-    allimages,allmasks,all_labels = load_images(imtype,n_images+n_testimages+n_validimages,impaths,maskpaths)
-    
-    #training images,masks
-    rimages,masks = allimages[:n_images], allmasks[:n_images]
-    
-    #test images, masks, labels
-    start_idx,end_idx = n_images,n_images+n_testimages
-    testimages,testmasks,testlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
-    
-    #validation images, masks, labels
-    start_idx,end_idx = n_images+n_testimages,n_images+n_testimages+n_validimages
-    validimages,validmasks,validlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
-    
-    print 'Quantizing images'
-    qimages = get_quantized_images(rimages,qbins)
-    print 'Extracting image features'
-    imfeatures = get_image_features(rimages,imtype)
-    print 'Getting global color histogram'
-    fore_global_hist, back_global_hist = get_global_histograms(qimages,masks,totalbins)
-    print 'Done'
-    
-    kernels = get_all_kernels(n_procs,n_images,imfeatures,qimages,masks\
-                    ,fore_global_hist,back_global_hist,totalbins,sigma)
-    
-    #kernels = np.load('600KERNEL.npy')
-    #kernels = replace_theta(kernels,imfeatures,sigma)
-    
-    gram = get_graham_matrix(kernels,betas)
-    #gram = np.load('600GRAMNORAND.npy')
-     
-    ocSVM = svm.OneClassSVM(kernel='precomputed',nu=v)
-    ocSVM.fit(gram)
-    alpha = ocSVM.dual_coef_.flatten()
-    support_vecs = ocSVM.support_
-
-    #cross validate to find the best values of beta 1, beta 3, and lambda    
-    beta1,beta3,new_lambda_coef = cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
-                                    imfeatures,masks,fore_global_hist,back_global_hist,\
-                                    qbins,totalbins,sigma,lambda_coef,imtype,betas,alpha,\
-                                    support_vecs, trial_beta1s,trial_beta3s,trial_lambdas)
-    
-    betas = (beta1,betas[1],beta3)
-    lambda_coef = new_lambda_coef
-    print "After cross validating, choice of betas are",betas
-    print "After cross validating, choice of lambda is",lambda_coef
-    
-    get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
-                        fore_global_hist,back_global_hist,qbins,totalbins,\
-                        sigma,lambda_coef,imtype,betas,alpha,support_vecs,True,True)
-
+    #run_experiment('horses',4,10,10,10,False)
+    run_experiment('pedestrians',4,50,50,50,True)
     
     
     
