@@ -14,8 +14,11 @@ def mask_from_image(image,imtype):
         return np.logical_and(image[:,:,2]==128,image[:,:,1]==0)
     elif imtype == 'horses':
         return image[:,:,0]>128
-    elif imtype == 'pedestrians':
-        return image[:,:,0]>0
+    elif imtype == 'pennfudan':
+        #return image[:,:,0]>0
+        return np.logical_not(image[:,:,0]==150)
+    elif imtype == 'cats':
+        return image[:,:,0] == 1
 
 def get_image_paths(imtype,randorder=False):  
     i_m_fs = []
@@ -34,10 +37,17 @@ def get_image_paths(imtype,randorder=False):
         im_fs = ['../horse_images/' + f for f in im_fs]
         i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
         
-    elif imtype == 'pedestrians':
-        im_fs = os.listdir("../pedestrian_images")
-        m_fs = ['../pedestrian_segments/' + f for f in im_fs]
-        im_fs = ['../pedestrian_images/' + f for f in im_fs]
+    elif imtype == 'pennfudan':
+        im_fs = os.listdir("../pennfudan_images2")
+        m_fs = ['../pennfudan_segments2/' + f for f in im_fs]
+        im_fs = ['../pennfudan_images2/' + f for f in im_fs]
+                                
+        i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
+        
+    elif imtype == 'cats':
+        im_fs = [f for f in os.listdir("../pet-images") if "other" not in f and "py" not in f]
+        m_fs = ['../pet-trimaps/' + f[:-4] + ".png" for f in im_fs]
+        im_fs = ['../pet-images/' + f for f in im_fs]
                                 
         i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
         
@@ -56,11 +66,14 @@ def load_images(imtype,n,impaths,maskpaths):
     labeled = []
     newsize = None
     
-    if imtype == 'flowers' or imtype == 'horses':
+    if imtype == 'flowers' or imtype == 'horses' or imtype == 'cats':
         newsize = (256,256)
         
     elif imtype == 'pedestrians':
         newsize = (128,256)
+        
+    elif imtype == 'pennfudan':
+        newsize = (100,270)
         
     for im_f,m_f in zip(impaths,maskpaths)[:n]:
         im = cv2.imread(im_f)
@@ -83,7 +96,8 @@ def load_images(imtype,n,impaths,maskpaths):
     return rimages,masks,labeled
         
 #take each channel in the image, and put it in a bin uniformly between 0 and qbins
-def get_quantized_image(image,qbins):
+def get_quantized_image(image,qbins,imtype):
+    
     maxval = np.iinfo(image.dtype).max
     quantized = np.zeros((image.shape[0],image.shape[1]),dtype='uint32')
     for c in range(3):
@@ -93,8 +107,8 @@ def get_quantized_image(image,qbins):
     return quantized
     
 #2. qimages = get_quantized_images(rimages,qbins)
-def get_quantized_images(rimages,qbins):
-    qimages = [get_quantized_image(i,qbins) for i in rimages]
+def get_quantized_images(rimages,qbins,imtype):
+    qimages = [get_quantized_image(i,qbins,imtype) for i in rimages]
     return qimages
     
 #as specified in paper:
@@ -133,20 +147,42 @@ def get_pedestrian_hog_features(image):
     
     #(64-40)%24 ==0 yes
     #(128-48)%80
-    blockSize = (80,160)
-    blockStride = (48,96)
-    cellSize = (16,16)
+    blockSize = (96,192)
+    blockStride = (32,64)
+    cellSize = (32,64)
     bins = 9
     
     descriptor = cv2.HOGDescriptor(winSize,blockSize,blockStride,cellSize,bins)
     d= descriptor.compute(image).flatten()
+    print len(d)
+    return d
+    
+def get_pennfudan_hog_features(image):
+    rows,cols,_ = image.shape
+    
+    winSize = (cols,rows)
+    
+    #(64-40)%24 ==0 yes
+    #(128-48)%80
+    
+    #3+, so 90 or more
+    blockSize = (60,100)
+    blockStride = (40,85)
+    cellSize = (20,50)
+    bins = 9
+    
+    descriptor = cv2.HOGDescriptor(winSize,blockSize,blockStride,cellSize,bins)
+    d= descriptor.compute(image).flatten()
+    #print len(d)
     return d
   
 def get_image_feature(rimage,imtype):
-    if imtype == 'flowers' or imtype=='horses':
+    if imtype == 'flowers' or imtype=='horses' or imtype == 'cats':
         return get_manfredi_hog_features(rimage)
     elif imtype == 'pedestrians':
         return get_pedestrian_hog_features(rimage)
+    elif imtype == 'pennfudan':
+        return get_pennfudan_hog_features(rimage)
         
 def get_image_features(rimages, imtype):
     return [get_image_feature(i,imtype) for i in rimages]
@@ -216,7 +252,9 @@ def get_fidelity_to_histogram(qimage,mask,forehist,backhist):
 
 def theta(feat1,feat2,sigma):
     dist = np.linalg.norm(np.array(feat1)-np.array(feat2))
-    return np.exp(-dist/ (2*sigma*sigma))
+    val =  np.exp(-dist/ (2*sigma*sigma))
+    print "theta is ",val
+    return val
     
 def omega1(mask1,mask2):
     total_same =  np.sum(mask1.astype('uint8')==mask2.astype('uint8'))
@@ -310,7 +348,7 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
                             betas,alpha,support_vecs):
     #first resize test image to the correct size and gather features
     rtest = cv2.resize(testimg,(qimages[0].shape[1],qimages[0].shape[0]))
-    qtest = get_quantized_image(rtest,qbins)
+    qtest = get_quantized_image(rtest,qbins,imtype)
     feattest = get_image_feature(rtest,imtype)
     #based on test image (j) compared to each support vector image-mask (i)
     
@@ -345,6 +383,10 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         
         svecfidelity,_ = get_fidelity_to_histogram(qimages[idx],masks[idx],global_forehist,global_backhist)
         gammas.append(svecfidelity)
+        
+    best_thetas = sorted(enumerate(thetas),key= lambda t:t[1])
+    bt1 = rimages[best_thetas[-1][0]]
+    bt2 = rimages[best_thetas[-2][0]]
     
     for i,idx in enumerate(support_vecs):
         #if i %100 ==0:
@@ -356,9 +398,9 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         support_fore += betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
         support_fore += betas[2] * pf3ip_test * gammas[i]
         
-        fore_beta1 += betas[0]*masks[idx]
-        fore_beta2 += betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
-        fore_beta3 += betas[2] * pf3ip_test * gammas[i]
+        fore_beta1 += alpha[i]*support_theta*betas[0]*masks[idx]
+        fore_beta2 += alpha[i]*support_theta*betas[1] * get_minus_log_prob_pixels(qtest,back_hists[i])
+        fore_beta3 += alpha[i]*support_theta*betas[2] * pf3ip_test * gammas[i]
         
         support_fore *= support_theta
         support_fore *= alpha[i]
@@ -369,16 +411,16 @@ def get_unary_potentials(testimg,rimages,qimages,imfeatures,masks,global_forehis
         support_back += betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
         support_back += betas[2] * pb3ip_test * gammas[i]
         
-        fore_beta1 -= betas[0]*(1-masks[idx])
-        fore_beta2 -= betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
-        fore_beta3 -= betas[2] * pb3ip_test * gammas[i]
+        fore_beta1 -= alpha[i]*support_theta*betas[0]*(1-masks[idx])
+        fore_beta2 -= alpha[i]*support_theta*betas[1] * get_minus_log_prob_pixels(qtest,fore_hists[i])
+        fore_beta3 -= alpha[i]*support_theta*betas[2] * pb3ip_test * gammas[i]
         
         support_back *= support_theta
         support_back *= alpha[i]
         back_potential += support_back
         
     #now compute foreground potentials
-    return fore_potential,back_potential,fore_beta1,fore_beta2,fore_beta3
+    return fore_potential,back_potential,fore_beta1,fore_beta2,fore_beta3,bt1,bt2
     
 def pixelwise_norms(image):
     return np.sqrt(image[:,:,0]**2 + image[:,:,1]**2 + image[:,:,2]**2)
@@ -419,7 +461,7 @@ def get_argmax_image(rimage,fore_potential,back_potential,lambda_coef):
     structure[2,1] = 1
     weights = np.zeros((rimage.shape[0],rimage.shape[1]))
     bottomdists = pixelwise_norms(rimage[1:,:,:] - rimage[:-1,:,:])
-    weights[:-1,:] = lambda_coef * np.exp(-bottomdists/(2*sigma*sigma))
+    weights[:-1,:] =  lambda_coef * np.exp(-bottomdists/(2*sigma*sigma))
     graph.add_grid_edges(nodeids, structure=structure, weights=weights)
     
     #finally, bottom-right pointing edges
@@ -427,7 +469,7 @@ def get_argmax_image(rimage,fore_potential,back_potential,lambda_coef):
     structure[2,2] = 1
     weights = np.zeros((rimage.shape[0],rimage.shape[1]))
     bottomrightdists = pixelwise_norms(rimage[1:,1:,:] - rimage[:-1,:-1,:])
-    weights[:-1,:-1] = lambda_coef * (1/np.sqrt(2))*np.exp(-bottomrightdists/(2*sigma*sigma))
+    weights[:-1,:-1] =  lambda_coef * (1/np.sqrt(2))*np.exp(-bottomrightdists/(2*sigma*sigma))
     graph.add_grid_edges(nodeids, structure=structure, weights=weights)
     
     #now get the solution!    
@@ -435,6 +477,18 @@ def get_argmax_image(rimage,fore_potential,back_potential,lambda_coef):
     # Get the segments of the nodes in the grid.
     sgm = graph.get_grid_segments(nodeids)
     return sgm
+    
+def measure_fg_accuracy(mask,realmask):
+    both_fg = np.logical_and(mask,realmask)
+    #Uses Pascal VOC criteria for accuracy
+    return float(np.sum(both_fg))/np.sum(np.logical_or(mask,realmask))
+    
+def measure_bg_accuracy(mask,realmask):
+    maskbg = np.logical_not(mask)
+    realbg = np.logical_not(realmask)
+    
+    bothbg = np.logical_and(maskbg,realbg)
+    return float(np.sum(bothbg))/np.sum(np.logical_or(maskbg,realbg))
     
 def measure_sa_accuracy(mask,realmask,labeled):
     same_in_label = np.logical_and(labeled, mask==realmask)
@@ -449,12 +503,12 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive=False,log_dir=False):
          
-    total_a_acc,total_o_acc,total_ims = 0,0,0      
-    a_accs = []
-    o_accs = []             
+    total_a_acc,total_o_acc,total_ims = 0,0,0     
+    total_fg_acc,total_bg_acc=0,0
+    
     for i in range(len(testimages)):
 
-        fore,back,b1,b2,b3 = get_unary_potentials(testimages[i],rimages,qimages,imfeatures,masks,fore_global_hist,\
+        fore,back,b1,b2,b3,bt1,bt2 = get_unary_potentials(testimages[i],rimages,qimages,imfeatures,masks,fore_global_hist,\
                                     back_global_hist,qbins,totalbins,sigma,imtype,\
                                     betas,alpha,support_vecs)
                                     
@@ -467,21 +521,25 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
         
         a_acc = measure_sa_accuracy(amax,rtestmask,rtestlabeled)
         o_acc = measure_so_accuracy(amax,rtestmask,rtestlabeled)
-        a_accs.append(a_acc)
-        o_accs.append(o_acc)
+        fg_acc = measure_fg_accuracy(amax,rtestmask)
+        bg_acc = measure_bg_accuracy(amax,rtestmask)
                 
         total_a_acc += a_acc
         total_o_acc += o_acc
+        total_bg_acc += bg_acc
+        total_fg_acc += fg_acc
         total_ims+=1
-        
-       
         
         if interactive or log_dir:
             print "Testing on test image",i
             print "s_a Image accuracy is ",a_acc
             print "s_o Image accuracy is ",o_acc
+            print "fg Image accuracy is ",fg_acc
+            print "bg Image accuracy is ",bg_acc
             print "Average s_a accuracy is ",total_a_acc/total_ims
             print "Average s_o accuracy is ",total_o_acc/total_ims
+            print "Average bg accuracy is ",total_bg_acc/total_ims
+            print "Average fg accuracy is ",total_fg_acc/total_ims
         
             rmasked = rtest.copy()
             rmasked[amax==0]/=10
@@ -495,14 +553,22 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                 
                 f2 = plt.figure()
                 plt.imshow(b1)
+                plt.colorbar()
+                
                 f3 = plt.figure()
                 plt.imshow(b2)
+                plt.colorbar()
+                
                 f4 = plt.figure()
                 plt.imshow(b3)
+                plt.colorbar()
                 
                 cv2.imshow('Original', rtest)
                 cv2.imshow('Argmax Masked image',rmasked)
                 cv2.imshow('Ground Truth Masked Image',rgroundtruth)
+                
+                cv2.imshow("Closest theta match",bt1)
+                cv2.imshow("Second closest theta match",bt2)
                 
                 cv2.waitKey()
                 [plt.close(f) for f in [f1,f2,f3,f4]]
@@ -514,18 +580,24 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
             
     avg_a_acc = total_a_acc/total_ims
     avg_o_acc = total_o_acc/total_ims
+    avg_fg_acc = total_fg_acc/total_ims
+    avg_bg_acc = total_bg_acc/total_ims
     
-    return avg_a_acc,avg_o_acc,np.median(a_accs),np.median(o_accs)
+    return avg_a_acc,avg_o_acc,avg_fg_acc,avg_bg_acc
     
 def get_test_accuracy_worker(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs,queue):
                             
-    a_acc,o_acc,_,_ = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
+    a_acc,o_acc,fg_acc,bg_acc = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
                         fore_global_hist,back_global_hist,qbins,totalbins,\
                         sigma,lambda_coef,imtype,betas,alpha,support_vecs)
     #validation accuracy given by average of s_o and s_a
-    queue.put((a_acc+o_acc)/2)
+    if imtype=='pennfudan':
+        accuracy = (fg_acc+bg_acc)/2.0 #optimize fg/bg accuracy for penn-fudan
+    else:
+        accuracy = (a_acc+o_acc)/2.0
+    queue.put((accuracy, o_acc,a_acc,fg_acc,bg_acc))
     
 
 def cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
@@ -595,11 +667,20 @@ def cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
         proc.join()
     
     
-    accs = [q.get() for q in job_qs]
+    fullaccs = [q.get() for q in job_qs]
+    accs = [t[0] for t in fullaccs]
+    o_accs = [t[1] for t in fullaccs]
+    a_accs = [t[2] for t in fullaccs]
+    fg_accs = [t[3] for t in fullaccs]
+    bg_accs = [t[4] for t in fullaccs]   
     
-    for config,acc in zip(all_configs,accs):
+    for config,acc,o_acc,a_acc,fg_acc,bg_acc in zip(all_configs,accs,o_accs,a_accs,fg_accs,bg_accs):
         print "With betas",config[0],"lambda",config[1],"and nu",config[2]
-        print "Accuracy is ",acc
+        print "s_a accuracy is ",a_acc
+        print "s_o accuracy is ",o_acc
+        print "avg accuracy is ",acc
+        print "fg accuracy is ",fg_acc
+        print "bg accuracy is ",bg_acc
         
     best_beta1idx = max([t for t in enumerate(accs) if t[0] in beta1_idxs],\
                         key = lambda t:t[1])[0]
@@ -640,7 +721,7 @@ def cross_validate(n_procs,validimages,validmasks,validlabels,rimages,qimages,\
 #n_procs is number of simulatneous processes to run on your machine
 #ntrain is number of images to use for training, ditto for test and validation
 #interactive=True if you want to see argmax test results, otherwise False
-def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
+def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive,flip_images=False):
     
     seed = int(time.time())
     np.random.seed(seed)
@@ -680,17 +761,30 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
         trial_lambdas = [.05,.12,.18,.25,.32,.5]
         trial_nus = [.07,.14,.2,.27,.34]
         
-    elif imtype=='pedestrians':
-    #start with the Manfredi flowers parameters
-        betas = (.24,1.0,.11)
-        nu = .36
-        lambda_coef = .05
+    elif imtype=='cats':
+        betas = (.28,1.0,0.05)
+        nu = 0.24
+        lambda_coef = 0.18
         
-        trial_beta1s = [.5,.7]
-        trial_beta3s = [.2,.4]
-        trial_lambdas = [.2,.3,.4]
-        trial_nus = [.28,.44]
-        sigma = 1
+        #coefficients to cross validate over
+        trial_beta1s = [.21,.28,]
+        trial_beta3s = [.05,.08,.11]
+        trial_lambdas = [.18,.25]
+        trial_nus = [.24,.40]
+        
+    elif imtype=='pennfudan':
+        betas = (.28,1.0,0.05)
+        nu = 0.24
+        lambda_coef = 1.25
+        
+        #coefficients to cross validate over
+        trial_beta1s = [1.3,1.8]
+        trial_beta3s = [.01,.05]
+        trial_lambdas = [.7,.9,1.5]
+        trial_nus = [.25,.45]
+        sigma = .5
+        qbins = 20
+        totalbins = int(qbins**3)
     
     print 'Loading images and test images'
     impaths,maskpaths = get_image_paths(imtype,rand_order)
@@ -704,12 +798,18 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
     start_idx,end_idx = n_images,n_images+n_testimages
     testimages,testmasks,testlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
     
+        
     #validation images, masks, labels
     start_idx,end_idx = n_images+n_testimages,n_images+n_testimages+n_validimages
     validimages,validmasks,validlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
     
+    if flip_images:
+        rimages += [np.fliplr(im) for im in rimages]
+        masks += [np.fliplr(im) for im in masks]
+        n_images*=2
+        
     print 'Quantizing images'
-    qimages = get_quantized_images(rimages,qbins)
+    qimages = get_quantized_images(rimages,qbins,imtype)
     print 'Extracting image features'
     imfeatures = get_image_features(rimages,imtype)
     print 'Getting global color histogram'
@@ -734,29 +834,33 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive):
     log_dir = imtype+ "_testlog_" + str(seed)
     os.mkdir(log_dir)
     
-    print 'Getting test accuracy'
-    a_acc,o_acc,med_a,med_o = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
-                        fore_global_hist,back_global_hist,qbins,totalbins,\
-                        sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive,log_dir)
-    
     log_f = open(os.path.join(log_dir,'results.txt'),'w')
     log_f.write("Betas chosen were {0}\n".format(str(betas)))
     log_f.write("lambda chosen was {0}\n".format(str(lambda_coef)))
     log_f.write("nu chosen was {0}\n".format(str(nu)))
-    log_f.write("s_o accuracy average is {0}\n".format(o_acc))
-    log_f.write("s_a accuracy average is {0}\n".format(a_acc))
-    log_f.write("s_o accuracy median is {0}\n".format(med_o))
-    log_f.write("s_a accuracy median is {0}\n".format(med_a))
-    log_f.close()
-    
     np.save(os.path.join(log_dir,"svecs.npy"),support_vecs)
     np.save(os.path.join(log_dir,"alpha.npy"),alpha)
     np.save(os.path.join(log_dir,"kernels.npy"),kernels)
-
+    log_f.close()
+    
+    print 'Getting test accuracy'
+    a_acc,o_acc,fg_acc,bg_acc = get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures,masks,\
+                        fore_global_hist,back_global_hist,qbins,totalbins,\
+                        sigma,lambda_coef,imtype,betas,alpha,support_vecs,interactive,log_dir)
+    
+    log_f = open(os.path.join(log_dir,'results.txt'),'a')
+    log_f.write("s_o accuracy average is {0}\n".format(o_acc))
+    log_f.write("s_a accuracy average is {0}\n".format(a_acc))
+    log_f.write("fg accuracy average is {0}\n".format(fg_acc))
+    log_f.write("bg accuracy median is {0}\n".format(bg_acc))
+    log_f.close()
+    
 if __name__ == '__main__':    
     #imtype, number of processors, training images, test images, valid images, interactive mode
     #run_experiment('horses',4,10,10,10,False)
-    run_experiment('pedestrians',4,50,50,50,True)
+    #run_experiment('pedestrians',4,125,50,50,True)
+    run_experiment('pennfudan',4,50,50,50,True,True)
+    #run_experiment('cats',4,200,50,50,True)
     
     
     
