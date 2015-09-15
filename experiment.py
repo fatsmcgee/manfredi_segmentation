@@ -38,9 +38,9 @@ def get_image_paths(imtype,randorder=False):
         i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
         
     elif imtype == 'pennfudan':
-        im_fs = os.listdir("../pennfudan_images2")
-        m_fs = ['../pennfudan_segments2/' + f for f in im_fs]
-        im_fs = ['../pennfudan_images2/' + f for f in im_fs]
+        im_fs = os.listdir("pennfudan_images2")
+        m_fs = ['pennfudan_segments2/' + f for f in im_fs]
+        im_fs = ['pennfudan_images2/' + f for f in im_fs]
                                 
         i_m_fs = [t for t in zip(im_fs,m_fs) if os.path.isfile(t[1])]
         
@@ -547,7 +547,8 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
             rgroundtruth[rtestmask==0]/=10
             
             if interactive:
-                f1 = plt.figure()
+                
+                """f1 = plt.figure()
                 plt.imshow(fore-back)
                 plt.colorbar()
                 
@@ -561,7 +562,7 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                 
                 f4 = plt.figure()
                 plt.imshow(b3)
-                plt.colorbar()
+                plt.colorbar()"""
                 
                 cv2.imshow('Original', rtest)
                 cv2.imshow('Argmax Masked image',rmasked)
@@ -570,8 +571,37 @@ def get_test_accuracy(testimages,testmasks,testlabels,rimages,qimages,imfeatures
                 cv2.imshow("Closest theta match",bt1)
                 cv2.imshow("Second closest theta match",bt2)
                 
+                f5 = plt.figure()
+                plt.subplot(1,6,1)
+                plt.imshow(cv2.cvtColor(rtest,cv2.COLOR_BGR2RGB))
+                plt.axis('off')
+                
+                plt.subplot(1,6,2)
+                plt.imshow(cv2.cvtColor(rmasked,cv2.COLOR_BGR2RGB))
+                plt.axis('off')
+                
+                plt.subplot(1,6,3)
+                plt.imshow(b1)
+                plt.colorbar()
+                plt.axis('off')
+                
+                plt.subplot(1,6,4)
+                plt.imshow(b2)
+                plt.colorbar()
+                plt.axis('off')
+                
+                plt.subplot(1,6,5)
+                plt.imshow(b3)
+                plt.colorbar()
+                plt.axis('off')
+                
+                plt.subplot(1,6,6)
+                plt.imshow(fore-back)
+                plt.colorbar()
+                plt.axis('off')
+                
                 cv2.waitKey()
-                [plt.close(f) for f in [f1,f2,f3,f4]]
+                [plt.close(f) for f in [f5]]
                 
             if log_dir:
                 cv2.imwrite(os.path.join(log_dir,'test_amax{0}.png'.format(i)),rmasked)
@@ -773,14 +803,14 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive,flip_images=Fa
         trial_nus = [.24,.40]
         
     elif imtype=='pennfudan':
-        betas = (.28,1.0,0.05)
+        betas = (1.0,1.0,0.05)
         nu = 0.24
-        lambda_coef = 1.25
+        lambda_coef = 1.00
         
         #coefficients to cross validate over
-        trial_beta1s = [1.3,1.8]
-        trial_beta3s = [.01,.05]
-        trial_lambdas = [.7,.9,1.5]
+        trial_beta1s = [0.7,0.9,1.3,1.8]
+        trial_beta3s = [.01,.05,.1,.2]
+        trial_lambdas = [.5,.7,.9,1.5,1.8]
         trial_nus = [.25,.45]
         sigma = .5
         qbins = 20
@@ -797,7 +827,6 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive,flip_images=Fa
     #test images, masks, labels
     start_idx,end_idx = n_images,n_images+n_testimages
     testimages,testmasks,testlabels = allimages[start_idx:end_idx],allmasks[start_idx:end_idx],all_labels[start_idx:end_idx]
-    
         
     #validation images, masks, labels
     start_idx,end_idx = n_images+n_testimages,n_images+n_testimages+n_validimages
@@ -856,11 +885,11 @@ def run_experiment(imtype,n_procs,ntrain,ntest,nvalid,interactive,flip_images=Fa
     log_f.close()
     
 if __name__ == '__main__':    
-    #imtype, number of processors, training images, test images, valid images, interactive mode
+    #imtype, number of processors,# training images, #test images, #valid images, interactive mode, flip images
     #run_experiment('horses',4,10,10,10,False)
     #run_experiment('pedestrians',4,125,50,50,True)
-    run_experiment('pennfudan',4,50,50,50,True,True)
     #run_experiment('cats',4,200,50,50,True)
+    run_experiment('pennfudan',16,100,34,35,True,True)
     
     
     
